@@ -51,6 +51,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
         # [FIX] New state flag: mark whether inside tool_call structure block
         self.is_inside_tool_call: bool = False
 
+        # JSON-format tool call buffer (for models that output JSON instead of <function=> XML)
+        self._json_tool_buffer: str = ""
+        self._json_mode: bool = False
+
         # Initialize attributes that were missing in the original PR
         self.current_func_name: Optional[str] = None
 
@@ -188,42 +192,61 @@ class Qwen3CoderDetector(BaseFormatDetector):
             for tool_content in raw_tool_calls:
                 # Find function calls
                 funcs = self.tool_call_function_regex.findall(tool_content)
-                for func_match in funcs:
-                    func_body = func_match[0] or func_match[1]
-                    if ">" not in func_body:
-                        continue
-
-                    name_end = func_body.index(">")
-                    func_name = func_body[:name_end]
-                    params_str = func_body[name_end + 1 :]
-
-                    param_config = self._get_arguments_config(func_name, tools)
-                    parsed_params = {}
-
-                    for p_match in self.tool_call_parameter_regex.findall(params_str):
-                        if ">" not in p_match:
+                if funcs:
+                    for func_match in funcs:
+                        func_body = func_match[0] or func_match[1]
+                        if ">" not in func_body:
                             continue
-                        p_idx = p_match.index(">")
-                        p_name = p_match[:p_idx]
-                        p_val = p_match[p_idx + 1 :]
-                        # Remove prefixing and trailing \n
-                        if p_val.startswith("\n"):
-                            p_val = p_val[1:]
-                        if p_val.endswith("\n"):
-                            p_val = p_val[:-1]
 
-                        parsed_params[p_name] = self._convert_param_value(
-                            p_val, p_name, param_config, func_name
-                        )
+                        name_end = func_body.index(">")
+                        func_name = func_body[:name_end]
+                        params_str = func_body[name_end + 1 :]
 
-                    calls.append(
-                        ToolCallItem(
-                            tool_index=tool_idx,
-                            name=func_name,
-                            parameters=json.dumps(parsed_params, ensure_ascii=False),
+                        param_config = self._get_arguments_config(func_name, tools)
+                        parsed_params = {}
+
+                        for p_match in self.tool_call_parameter_regex.findall(params_str):
+                            if ">" not in p_match:
+                                continue
+                            p_idx = p_match.index(">")
+                            p_name = p_match[:p_idx]
+                            p_val = p_match[p_idx + 1 :]
+                            # Remove prefixing and trailing \n
+                            if p_val.startswith("\n"):
+                                p_val = p_val[1:]
+                            if p_val.endswith("\n"):
+                                p_val = p_val[:-1]
+
+                            parsed_params[p_name] = self._convert_param_value(
+                                p_val, p_name, param_config, func_name
+                            )
+
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=tool_idx,
+                                name=func_name,
+                                parameters=json.dumps(parsed_params, ensure_ascii=False),
+                            )
                         )
-                    )
-                    tool_idx += 1
+                        tool_idx += 1
+                else:
+                    # JSON fallback: model outputs {"name": "...", "arguments": {...}}
+                    try:
+                        parsed_call = json.loads(tool_content.strip())
+                        func_name = parsed_call.get("name", "")
+                        arguments = parsed_call.get("arguments", parsed_call.get("input", {}))
+                        if isinstance(arguments, str):
+                            arguments = json.loads(arguments)
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=tool_idx,
+                                name=func_name,
+                                parameters=json.dumps(arguments, ensure_ascii=False),
+                            )
+                        )
+                        tool_idx += 1
+                    except (json.JSONDecodeError, AttributeError):
+                        logger.warning(f"Failed to parse tool call content: {tool_content[:200]}")
 
             # Determine normal text (text before the first tool call)
             start_idx = text.find(self.tool_call_start_token)
@@ -266,7 +289,47 @@ class Qwen3CoderDetector(BaseFormatDetector):
             if current_slice.startswith(self.tool_call_start_token):
                 self.parsed_pos += len(self.tool_call_start_token)
                 self.is_inside_tool_call = True
+                self._json_tool_buffer = ""
+                self._json_mode = False
                 continue
+
+            # -------------------------------------------------------
+            # 1b. JSON-format tool call: buffer until </tool_call>
+            # -------------------------------------------------------
+            if self.is_inside_tool_call and not self._json_mode:
+                stripped = current_slice.lstrip()
+                if stripped.startswith("{"):
+                    self._json_mode = True
+
+            if self._json_mode:
+                end_idx = current_slice.find(self.tool_call_end_token)
+                if end_idx != -1:
+                    self._json_tool_buffer += current_slice[:end_idx]
+                    try:
+                        parsed_call = json.loads(self._json_tool_buffer.strip())
+                        func_name = parsed_call.get("name", "")
+                        arguments = parsed_call.get("arguments", parsed_call.get("input", {}))
+                        if isinstance(arguments, str):
+                            arguments = json.loads(arguments)
+                        self.current_tool_id += 1
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=func_name,
+                                parameters=json.dumps(arguments, ensure_ascii=False),
+                            )
+                        )
+                    except (json.JSONDecodeError, AttributeError) as e:
+                        logger.warning(f"Failed to parse JSON tool call: {e}")
+                    self._json_tool_buffer = ""
+                    self._json_mode = False
+                    self.is_inside_tool_call = False
+                    self.parsed_pos += end_idx + len(self.tool_call_end_token)
+                    continue
+                else:
+                    self._json_tool_buffer += current_slice
+                    self.parsed_pos += len(current_slice)
+                    break
 
             # -------------------------------------------------------
             # 2. Function Name: <function=name>

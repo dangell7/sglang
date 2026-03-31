@@ -192,6 +192,7 @@ class AnthropicServing:
             openai_msg = {"role": msg.role}
             content_parts = []
             tool_calls = []
+            thinking_parts = []
 
             for block in msg.content:
                 if block.type == "text" and block.text:
@@ -203,6 +204,10 @@ class AnthropicServing:
                     )
                     if image_part is not None:
                         content_parts.append(image_part)
+
+                elif block.type in ("thinking", "redacted_thinking"):
+                    if block.thinking:
+                        thinking_parts.append(block.thinking)
 
                 elif block.type == "tool_use":
                     tool_call = {
@@ -239,6 +244,23 @@ class AnthropicServing:
                                 "text": f"Tool result: {tool_text}",
                             }
                         )
+
+            # Reconstruct thinking content with <think> tags for the chat
+            # template. The model originally generated <think>...</think>text,
+            # so we rebuild that format from the separate Anthropic blocks.
+            if thinking_parts and msg.role == "assistant":
+                thinking_content = "\n".join(thinking_parts)
+                wrapped = f"<think>\n{thinking_content}\n</think>"
+                text_items = [
+                    p for p in content_parts if p.get("type") == "text"
+                ]
+                if text_items:
+                    # Prepend thinking to the first text part
+                    text_items[0]["text"] = wrapped + text_items[0]["text"]
+                else:
+                    content_parts.insert(
+                        0, {"type": "text", "text": wrapped}
+                    )
 
             # Attach tool calls to assistant messages
             if tool_calls:
@@ -287,7 +309,7 @@ class AnthropicServing:
             else:
                 thinking_key = "enable_thinking"
 
-            enabled = anthropic_request.thinking.type == "enabled"
+            enabled = anthropic_request.thinking.type in ("enabled", "adaptive")
             chat_request.separate_reasoning = enabled
             if enabled:
                 chat_request.stream_reasoning = True
@@ -379,11 +401,22 @@ class AnthropicServing:
 
         # Check for error responses from OpenAI handler
         if not isinstance(response, ChatCompletionResponse):
-            # It's an error response (ORJSONResponse)
+            # Extract error details from the ORJSONResponse if possible
+            error_detail = "Internal processing error"
+            try:
+                if hasattr(response, 'body'):
+                    import orjson
+                    body = orjson.loads(response.body)
+                    error_detail = body.get("message", error_detail)
+                    logger.error(
+                        "OpenAI handler returned error: %s", error_detail
+                    )
+            except Exception:
+                pass
             return self._error_response(
                 status_code=500,
                 error_type="internal_error",
-                message="Internal processing error",
+                message=error_detail,
             )
 
         # Convert to Anthropic response
@@ -461,6 +494,7 @@ class AnthropicServing:
         usage_info: Optional[dict] = None
         message_id = f"msg_{uuid.uuid4().hex}"
         model = anthropic_request.model
+        text_content_buffer: list[str] = []
 
         async for sse_line in openai_stream:
             if not sse_line.startswith("data: "):
@@ -481,8 +515,39 @@ class AnthropicServing:
                     )
                     thinking_block_open = False
 
+                # Flush text buffer (discard model placeholder text)
+                if text_content_buffer:
+                    accumulated = "".join(text_content_buffer)
+                    if accumulated.strip() != "(no content)":
+                        if not content_block_open:
+                            start_event = AnthropicStreamEvent(
+                                type="content_block_start",
+                                index=content_block_index,
+                                content_block=AnthropicContentBlock(
+                                    type="text", text=""
+                                ),
+                            )
+                            yield _wrap_sse_event(
+                                start_event.model_dump_json(exclude_none=True),
+                                "content_block_start",
+                            )
+                            content_block_open = True
+                        delta_event = AnthropicStreamEvent(
+                            type="content_block_delta",
+                            index=content_block_index,
+                            delta=AnthropicDelta(
+                                type="text_delta",
+                                text=accumulated,
+                            ),
+                        )
+                        yield _wrap_sse_event(
+                            delta_event.model_dump_json(exclude_none=True),
+                            "content_block_delta",
+                        )
+                    text_content_buffer = []
+
                 # Close any open content block
-                elif content_block_open:
+                if content_block_open:
                     stop_event = AnthropicStreamEvent(
                         type="content_block_stop",
                         index=content_block_index,
@@ -628,6 +693,37 @@ class AnthropicServing:
                 content_block_index += 1
                 thinking_block_open = False
 
+            # Flush text buffer before tool calls (discard model placeholder)
+            if delta.tool_calls and text_content_buffer:
+                accumulated = "".join(text_content_buffer)
+                if accumulated.strip() != "(no content)":
+                    if not content_block_open:
+                        start_event = AnthropicStreamEvent(
+                            type="content_block_start",
+                            index=content_block_index,
+                            content_block=AnthropicContentBlock(
+                                type="text", text=""
+                            ),
+                        )
+                        yield _wrap_sse_event(
+                            start_event.model_dump_json(exclude_none=True),
+                            "content_block_start",
+                        )
+                        content_block_open = True
+                    delta_event = AnthropicStreamEvent(
+                        type="content_block_delta",
+                        index=content_block_index,
+                        delta=AnthropicDelta(
+                            type="text_delta",
+                            text=accumulated,
+                        ),
+                    )
+                    yield _wrap_sse_event(
+                        delta_event.model_dump_json(exclude_none=True),
+                        "content_block_delta",
+                    )
+                text_content_buffer = []
+
             # Handle tool call deltas
             if delta.tool_calls:
                 for tc in delta.tool_calls:
@@ -696,34 +792,53 @@ class AnthropicServing:
                         )
                 continue
 
-            # Handle text content deltas
+            # Handle text content deltas (buffered to filter placeholder text)
             if delta.content is not None and delta.content != "":
-                # Start a text content block if needed
-                if not content_block_open:
-                    start_event = AnthropicStreamEvent(
-                        type="content_block_start",
+                if content_block_open:
+                    # Block already open (buffer was flushed), emit directly
+                    delta_event = AnthropicStreamEvent(
+                        type="content_block_delta",
                         index=content_block_index,
-                        content_block=AnthropicContentBlock(type="text", text=""),
+                        delta=AnthropicDelta(
+                            type="text_delta",
+                            text=delta.content,
+                        ),
                     )
                     yield _wrap_sse_event(
-                        start_event.model_dump_json(exclude_none=True),
-                        "content_block_start",
+                        delta_event.model_dump_json(exclude_none=True),
+                        "content_block_delta",
                     )
-                    content_block_open = True
-
-                # Emit text delta
-                delta_event = AnthropicStreamEvent(
-                    type="content_block_delta",
-                    index=content_block_index,
-                    delta=AnthropicDelta(
-                        type="text_delta",
-                        text=delta.content,
-                    ),
-                )
-                yield _wrap_sse_event(
-                    delta_event.model_dump_json(exclude_none=True),
-                    "content_block_delta",
-                )
+                else:
+                    # Buffer text to detect model placeholder
+                    text_content_buffer.append(delta.content)
+                    accumulated = "".join(text_content_buffer)
+                    if len(accumulated) > len("(no content)"):
+                        # Exceeds placeholder length, flush buffer
+                        start_event = AnthropicStreamEvent(
+                            type="content_block_start",
+                            index=content_block_index,
+                            content_block=AnthropicContentBlock(
+                                type="text", text=""
+                            ),
+                        )
+                        yield _wrap_sse_event(
+                            start_event.model_dump_json(exclude_none=True),
+                            "content_block_start",
+                        )
+                        content_block_open = True
+                        delta_event = AnthropicStreamEvent(
+                            type="content_block_delta",
+                            index=content_block_index,
+                            delta=AnthropicDelta(
+                                type="text_delta",
+                                text=accumulated,
+                            ),
+                        )
+                        yield _wrap_sse_event(
+                            delta_event.model_dump_json(exclude_none=True),
+                            "content_block_delta",
+                        )
+                        text_content_buffer = []
 
     def _convert_response(
         self, response: ChatCompletionResponse
@@ -748,8 +863,8 @@ class AnthropicServing:
                 )
             )
 
-        # Add text content
-        if choice.message.content:
+        # Add text content (filter model placeholder text)
+        if choice.message.content and choice.message.content.strip() != "(no content)":
             content.append(
                 AnthropicContentBlock(type="text", text=choice.message.content)
             )

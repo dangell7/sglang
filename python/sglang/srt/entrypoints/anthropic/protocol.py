@@ -107,7 +107,7 @@ class AnthropicCountTokensResponse(BaseModel):
 class AnthropicThinkingParam(BaseModel):
     """Thinking control parameter for Anthropic Messages API"""
 
-    type: Literal["enabled", "disabled"]
+    type: Literal["enabled", "disabled", "adaptive"]
     budget_tokens: Optional[int] = None
 
 
