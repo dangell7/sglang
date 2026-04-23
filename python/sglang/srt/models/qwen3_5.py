@@ -59,6 +59,8 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     PerTensorScaleParameter,
@@ -1235,6 +1237,48 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         prefix: str = "",
     ) -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        if self.pp_group.is_last_rank:
+            if self.pp_group.world_size == 1 and getattr(config, "tie_word_embeddings", False):
+                self.lm_head = self.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                )
+        else:
+            self.lm_head = PPMissingLayer()
+        self.logits_processor = LogitsProcessor(config)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        input_deepstack_embeds: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        hidden_states = super().forward(
+            input_ids, positions, forward_batch,
+            input_embeds=input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+            input_deepstack_embeds=input_deepstack_embeds,
+        )
+        if isinstance(hidden_states, PPProxyTensors):
+            return hidden_states
+        if isinstance(hidden_states, tuple):
+            hidden_states, aux_hidden_states = hidden_states
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            )
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
+        return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -1316,7 +1360,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             if "visual" in name:
                 continue
             if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
+                name = name.replace("model.language_model.", "")
+            if name.startswith("model."):
+                name = name[len("model."):]
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
 
@@ -1976,4 +2022,4 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
 
-EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
+EntryClass = [Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]

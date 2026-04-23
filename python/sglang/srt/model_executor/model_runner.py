@@ -51,6 +51,7 @@ from sglang.srt.configs import (
     NemotronHConfig,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
     Qwen3NextConfig,
 )
 from sglang.srt.configs.device_config import DeviceConfig
@@ -2191,16 +2192,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     @property
     def hybrid_gdn_config(self):
         config = self.model_config.hf_config.get_text_config()
+        gdn_model_types = {
+            "qwen3_next", "qwen3_5", "qwen3_5_text",
+            "qwen3_5_moe", "qwen3_5_moe_text",
+            "jet_nemotron", "jet_vlm",
+        }
         if isinstance(
             config,
             Qwen3NextConfig
             | Qwen3_5Config
             | Qwen3_5MoeConfig
             | InternS2PreviewConfig
+            | Qwen3_5MoeTextConfig
             | JetNemotronConfig
             | JetVLMConfig,
         ):
             return config
+        model_type = getattr(config, "model_type", None)
+        if model_type in gdn_model_types:
+            from sglang.srt.configs.qwen3_5 import Qwen3_5MoeTextConfig as _SglangTextConfig
+            from sglang.srt.configs.qwen3_next import Qwen3NextConfig as _SglangNextConfig
+            sglang_cls = _SglangTextConfig if "moe" in (model_type or "") else _SglangNextConfig
+            cfg_dict = {k: v for k, v in config.to_dict().items()
+                        if k not in ("layers_block_type", "linear_layer_ids",
+                                     "full_attention_layer_ids", "mamba2_cache_params")}
+            return sglang_cls(**cfg_dict)
         return None
 
     @property
