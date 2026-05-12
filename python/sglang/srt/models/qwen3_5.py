@@ -1649,7 +1649,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         config: Qwen3_5MoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        language_model_cls=Qwen3_5MoeForCausalLM,
+        language_model_cls=Qwen3_5ForCausalLM,
     ) -> None:
         super().__init__(config, quant_config, prefix, language_model_cls)
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
